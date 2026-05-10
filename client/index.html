@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Anon Relay</title>
+  <style>
+    body { background: #111; color: #eee; font-family: monospace; padding: 20px; }
+    #status { color: #0f0; margin-bottom: 10px; }
+    #peers { color: #aaa; margin-bottom: 20px; }
+    #log { background: #1a1a1a; padding: 10px; height: 200px; overflow-y: auto; border: 1px solid #333; }
+    .entry { margin: 4px 0; }
+    .from-me { color: #4af; }
+    .from-peer { color: #fa4; }
+    .system { color: #888; }
+    button { background: #222; color: #eee; border: 1px solid #444; padding: 6px 14px; cursor: pointer; margin-right: 6px; }
+    button:hover { background: #333; }
+    input { background: #222; color: #eee; border: 1px solid #444; padding: 6px; width: 300px; }
+    .row { margin-bottom: 8px; }
+    label { color: #aaa; font-size: 0.85em; display: block; margin-bottom: 3px; }
+    #peerDropdown { display:none; position:absolute; background:#222; border:1px solid #444; width:150px; z-index:10; }
+  </style>
+</head>
+<body>
+  <div id="status">Connecting...</div>
+  <div id="peers">Peers: none</div>
+  <div id="log"></div>
+  <br>
+  <div class="row">
+    <label>DM a specific node (leave empty to broadcast — unencrypted)</label>
+    <input id="targetInput" type="text" placeholder="Node ID e.g. 2" style="width:150px;" oninput="filterPeers()" />
+    <div id="peerDropdown"></div>
+  </div>
+  <div class="row">
+    <label>Message</label>
+    <input id="msgInput" type="text" placeholder="Type a message..." onkeydown="if(event.key==='Enter') sendMessage()" />
+    <button onclick="sendMessage()">Send</button>
+    <button onclick="refreshPeers()">Refresh peers</button>
+  </div>
+
+<script>
+// ─── Crypto ───────────────────────────────────────────────────────────────────
+
+const generateKeyPair = () => crypto.subtle.generateKey(
+  { name: 'RSA-OAEP', modulusLength: 2048, publicExponent: new Uint8Array([1,0,1]), hash: 'SHA-256' },
+  true, ['encrypt', 'decrypt']
+)
+
+const exportPublicKey = async (key) => {
+  const buf = await crypto.subtle.exportKey('spki', key)
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+}
+
+const importPublicKey = async (b64) => {
+  const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0))
+  return crypto.subtle.importKey('spki', bin, { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['encrypt'])
+}
+
+// Hybrid: RSA encrypts a one-time AES key, AES encrypts the actual data
+const encrypt = async (obj, rsaKeyStr) => {
+  const rsaPub = await importPublicKey(rsaKeyStr)
+  const aesKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt'])
+  const iv = crypto.getRandomValues(new Uint8Array(12))
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey,
+    new TextEncoder().encode(JSON.stringify(obj)))
+  const rawAes = await crypto.subtle.exportKey('raw', aesKey)
+  const encKey = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, rsaPub, rawAes)
+  return btoa(JSON.stringify({
+    k: btoa(String.fromCharCode(...new Uint8Array(encKey))),
+    iv: btoa(String.fromCharCode(...new Uint8Array(iv))),
+    d: btoa(String.fromCharCode(...new Uint8Array(ciphertext)))
+  }))
+}
+
+const decrypt = async (b64, privateKey) => {
+  const { k, iv, d } = JSON.parse(atob(b64))
+  const rawAes = await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, privateKey,
+    Uint8Array.from(atob(k), c => c.charCodeAt(0)))
+  const aesKey = await crypto.subtle.importKey('raw', rawAes, { name: 'AES-GCM' }, false, ['decrypt'])
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: Uint8Array.from(atob(iv), c => c.charCodeAt(0)) },
+    aesKey, Uint8Array.from(atob(d), c => c.charCodeAt(0)))
+  return JSON.parse(new TextDecoder().decode(plain))
+}
+
+// ─── State ────────────────────────────────────────────────────────────────────
+
+let myId = null
+let myKeyPair = null
+let myPublicKeyStr = null
+let peers = []
+let pendingOnion = null
+const peerPublicKeys = {}
+const announcedTo = new Set()
+const IDLE_TIMEOUT = 5 * 60 * 1000
+
+// ─── WebSocket ────────────────────────────────────────────────────────────────
+
+const ws = new WebSocket('ws://localhost:8080')
+const send = (obj) => ws.send(JSON.stringify(obj))
+
+// ─── UI ───────────────────────────────────────────────────────────────────────
+
+const log = (text, cls = '') => {
+  const div = Object.assign(document.createElement('div'), { className: 'entry ' + cls, textContent: text })
+  const el = document.getElementById('log')
+  el.appendChild(div)
+  el.scrollTop = el.scrollHeight
+}
+
+function filterPeers() {
+  const val = document.getElementById('targetInput').value.trim()
+  const dropdown = document.getElementById('peerDropdown')
+  const matches = peers.filter(p => p.startsWith(val) && val !== '')
+  if (!matches.length) { dropdown.style.display = 'none'; return }
+  dropdown.style.display = 'block'
+  dropdown.innerHTML = ''
+  matches.forEach(peerId => {
+    const item = Object.assign(document.createElement('div'), {
+      textContent: `Node ${peerId}`,
+      onclick: () => { document.getElementById('targetInput').value = peerId; dropdown.style.display = 'none' }
+    })
+    item.style.cssText = 'padding:6px 10px; cursor:pointer;'
+    item.onmouseover = () => item.style.background = '#333'
+    item.onmouseout = () => item.style.background = 'transparent'
+    dropdown.appendChild(item)
+  })
+}
+
+// ─── Peers ────────────────────────────────────────────────────────────────────
+
+function refreshPeers() { send({ type: 'get_peers' }) }
+
+function announceToNewPeers() {
+  if (!myPublicKeyStr || !myId) return
+  peers.forEach(peerId => {
+    if (announcedTo.has(peerId)) return
+    announcedTo.add(peerId)
+    send({ type: 'relay', to: peerId, direct: true,
+      data: JSON.stringify({ type: 'key_announce', publicKey: myPublicKeyStr, from: myId })
+    })
+    log(`Announced public key to node ${peerId}`, 'system')
+  })
+}
+
+// ─── Heartbeat + idle ─────────────────────────────────────────────────────────
+
+function startHeartbeat() {
+  setInterval(() => { if (ws.readyState === WebSocket.OPEN) send({ type: 'ping' }) }, 30000)
+}
+
+function startIdleDetection() {
+  let idleTimer = null
+  const reset = () => {
+    clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => { log('Idle 5 min — disconnecting', 'system'); ws.close() }, IDLE_TIMEOUT)
+  }
+  ;['click','keydown','mousemove','scroll'].forEach(e => window.addEventListener(e, reset))
+  reset()
+}
+
+// ─── Onion routing ────────────────────────────────────────────────────────────
+
+async function buildOnion(text, hops, recipientId) {
+  // Innermost layer — encrypted for the final recipient
+  let layer = await encrypt(
+    { type: 'onion_final', data: text, from: myId, senderKey: myPublicKeyStr },
+    peerPublicKeys[recipientId]
+  )
+
+  // Wrap backwards through hops — each hop gets told who to forward to next
+  // route = [hop1, hop2, hop3, recipient]
+  // hop3 gets: { next: recipient, data: layer_for_recipient }
+  // hop2 gets: { next: hop3,      data: layer_for_hop3 }
+  // hop1 gets: { next: hop2,      data: layer_for_hop2 }
+  const route = [...hops, recipientId]
+  for (let i = route.length - 2; i >= 0; i--) {
+    layer = await encrypt(
+      { type: 'onion_relay', next: route[i + 1], data: layer },
+      peerPublicKeys[route[i]]
+    )
+  }
+
+  // layer is now encrypted for hop1 — ready to send
+  return layer
+}
+
+async function sendOnion(text, targetId) {
+  send({ type: 'get_random_peers', exclude: [targetId] })
+  pendingOnion = { text, targetId }
+  log('Requesting onion route...', 'system')
+}
+
+async function handleOnionLayer(encryptedLayer) {
+  try {
+    const decrypted = await decrypt(encryptedLayer, myKeyPair.privateKey)
+
+    if (decrypted.type === 'onion_final') {
+      // We are the intended recipient
+      if (decrypted.senderKey && decrypted.from) peerPublicKeys[decrypted.from] = decrypted.senderKey
+      log(`[ONION] Node ${decrypted.from}: ${decrypted.data}`, 'from-peer')
+
+    } else if (decrypted.type === 'onion_relay') {
+      // We are a middle hop — forward the inner layer to the next node
+      console.log(`[${myId}] relaying onion → node ${decrypted.next}`)
+      send({ type: 'relay', to: decrypted.next, direct: true,
+        data: JSON.stringify({ type: 'onion', payload: decrypted.data })
+      })
+    }
+  } catch (e) {
+    console.log(`[${myId}] onion decrypt failed:`, e.message)
+  }
+}
+
+// ─── Message handler ──────────────────────────────────────────────────────────
+
+ws.onopen = () => {
+  document.getElementById('status').textContent = 'Connected to signaling server'
+  refreshPeers()
+  startHeartbeat()
+  startIdleDetection()
+}
+
+ws.onmessage = async (event) => {
+  const msg = JSON.parse(event.data)
+
+  if (msg.type === 'welcome') {
+    myId = msg.id
+    document.getElementById('status').textContent = `Connected — Your node ID: ${myId}`
+    log(`You joined as node ${myId}`, 'system')
+  }
+
+  if (msg.type === 'peers') {
+    peers = msg.peers
+    document.getElementById('peers').textContent =
+      peers.length ? `Peers online: ${peers.join(', ')}` : 'Peers: none (open another tab!)'
+    log(`Peer list updated: ${peers.length} peer(s) found`, 'system')
+    announceToNewPeers()
+  }
+
+  if (msg.type === 'random_peers') {
+    if (!pendingOnion) return
+    const { text, targetId } = pendingOnion
+    pendingOnion = null
+
+    const validHops = msg.hops.filter(h => peerPublicKeys[h])
+    log(`Onion route: You → ${validHops.length ? validHops.join(' → ') + ' → ' : ''}Node ${targetId}`, 'system')
+
+    const layer = await buildOnion(text, validHops, targetId)
+    const firstHop = validHops[0] || targetId
+
+    // Send as { type: 'onion', payload: <encrypted blob> }
+    // This way every hop recognises it consistently
+    send({ type: 'relay', to: firstHop, direct: true,
+      data: JSON.stringify({ type: 'onion', payload: layer })
+    })
+    log(`You → Node ${targetId} [onion]: ${text}`, 'from-me')
+  }
+
+  if (msg.type === 'relay') {
+    let inner
+    try {
+      inner = JSON.parse(msg.data)
+    } catch {
+      // Plain text broadcast
+      log(`Node ${msg.from} → everyone: ${msg.data}`, 'from-peer')
+      return
+    }
+
+    if (inner.type === 'key_announce') {
+      peerPublicKeys[inner.from] = inner.publicKey
+      log(`Got public key from node ${inner.from} — DMs ready`, 'system')
+      return
+    }
+
+    // Onion packet — try to decrypt our layer
+    if (inner.type === 'onion') {
+      await handleOnionLayer(inner.payload)
+      return
+    }
+  }
+}
+
+ws.onclose = () => {
+  document.getElementById('status').textContent = 'Disconnected'
+  document.getElementById('status').style.color = '#f44'
+}
+
+// ─── Send ─────────────────────────────────────────────────────────────────────
+
+async function sendMessage() {
+  const text = document.getElementById('msgInput').value.trim()
+  const targetId = document.getElementById('targetInput').value.trim()
+  if (!text) return
+
+  if (targetId) {
+    if (!peerPublicKeys[targetId]) {
+      log(`No public key for node ${targetId} yet — try Refresh peers`, 'system')
+      return
+    }
+    await sendOnion(text, targetId)
+  } else {
+    if (!peers.length) return
+    peers.forEach(peerId => send({ type: 'relay', to: peerId, data: text }))
+    log(`You → all peers: ${text}`, 'from-me')
+  }
+
+  document.getElementById('msgInput').value = ''
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
+generateKeyPair().then(async (keyPair) => {
+  myKeyPair = keyPair
+  myPublicKeyStr = await exportPublicKey(keyPair.publicKey)
+  log('Key pair generated', 'system')
+  announceToNewPeers()
+})
+</script>
+</body>
+</html>
