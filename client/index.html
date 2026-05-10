@@ -94,7 +94,8 @@ const IDLE_TIMEOUT = 5 * 60 * 1000
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 
-const ws = new WebSocket('ws://localhost:8080')
+const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+const ws = new WebSocket(`${wsProtocol}//${location.host}`)
 const send = (obj) => ws.send(JSON.stringify(obj))
 
 // ─── UI ───────────────────────────────────────────────────────────────────────
