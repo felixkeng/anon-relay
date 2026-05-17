@@ -2,11 +2,46 @@ const WebSocket = require('ws')
 const http = require('http')
 const fs = require('fs')
 const path = require('path')
+const https = require('https')
 
 const PORT = process.env.PORT || 8080
 
-// HTTP server to serve client files
+// ─── Persistent counter (survives redeploys) ──────────────────────────────────
+
+function incrementCounter(callback) {
+  https.get('https://countapi.xyz/hit/anon-relay-felix/nodes', (res) => {
+    let data = ''
+    res.on('data', chunk => data += chunk)
+    res.on('end', () => {
+      try { callback(JSON.parse(data).value) }
+      catch { callback(null) }
+    })
+  }).on('error', () => callback(null))
+}
+
+function getCounter(callback) {
+  https.get('https://countapi.xyz/get/anon-relay-felix/nodes', (res) => {
+    let data = ''
+    res.on('data', chunk => data += chunk)
+    res.on('end', () => {
+      try { callback(JSON.parse(data).value) }
+      catch { callback(0) }
+    })
+  }).on('error', () => callback(0))
+}
+
+// ─── HTTP server ──────────────────────────────────────────────────────────────
+
 const server = http.createServer((req, res) => {
+
+  if (req.url === '/stats') {
+    getCounter((total) => {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+      res.end(JSON.stringify({ totalNodes: total, activeNodes: nodes.size }))
+    })
+    return
+  }
+
   const filePath = path.join(__dirname, '../client', req.url === '/' ? 'index.html' : req.url)
   const ext = path.extname(filePath)
   const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' }
@@ -18,12 +53,13 @@ const server = http.createServer((req, res) => {
   })
 })
 
+// ─── WebSocket ────────────────────────────────────────────────────────────────
+
 const wss = new WebSocket.Server({ server })
 
 const nodes = new Map()
 const freedIds = []
 let nextId = 1
-
 const PING_TIMEOUT = 35000
 
 const assignId = () => freedIds.length > 0 ? freedIds.shift() : String(nextId++)
@@ -41,6 +77,7 @@ wss.on('connection', (socket) => {
   let kickTimer = null
 
   nodes.set(id, socket)
+  incrementCounter(() => {}) // increment lifetime count, fire and forget
   console.log(`Node ${id} connected. Active: ${nodes.size}`)
   socket.send(JSON.stringify({ type: 'welcome', id }))
 
